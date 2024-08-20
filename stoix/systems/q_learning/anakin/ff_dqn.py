@@ -32,7 +32,7 @@ from stoix.utils import make_env as environments
 from stoix.utils.checkpointing import Checkpointer
 from stoix.utils.jax_utils import unreplicate_batch_dim, unreplicate_n_dims
 from stoix.utils.logger import LogEvent, StoixLogger
-from stoix.utils.loss import munchausen_q_learning
+from stoix.utils.loss import q_learning
 from stoix.utils.total_timestep_checker import check_total_timesteps
 from stoix.utils.training import make_learning_rate
 from stoix.wrappers.episode_metrics import get_final_step_metrics
@@ -152,8 +152,7 @@ def get_learner_fn(
             ) -> jnp.ndarray:
 
                 q_tm1 = q_apply_fn(q_params, transitions.obs).preferences
-                q_tm1_target = q_apply_fn(target_q_params, transitions.obs).preferences
-                q_t_target = q_apply_fn(target_q_params, transitions.next_obs).preferences
+                q_t = q_apply_fn(target_q_params, transitions.next_obs).preferences
 
                 # Cast and clip rewards.
                 discount = 1.0 - transitions.done.astype(jnp.float32)
@@ -163,24 +162,21 @@ def get_learner_fn(
                 ).astype(jnp.float32)
                 a_tm1 = transitions.action
 
-                batch_loss = munchausen_q_learning(
+                # Compute Q-learning loss.
+                batch_loss = q_learning(
                     q_tm1,
-                    q_tm1_target,
                     a_tm1,
                     r_t,
                     d_t,
-                    q_t_target,
-                    config.system.entropy_temperature,
-                    config.system.munchausen_coefficient,
-                    config.system.clip_value_min,
+                    q_t,
                     config.system.huber_loss_parameter,
                 )
 
                 loss_info = {
-                    "q_loss": jnp.mean(batch_loss),
+                    "q_loss": batch_loss,
                 }
 
-                return jnp.mean(batch_loss), loss_info
+                return batch_loss, loss_info
 
             params, opt_states, buffer_state, key = update_state
 
@@ -325,7 +321,6 @@ def learner_setup(
         next_obs=jax.tree_util.tree_map(lambda x: x.squeeze(0), init_x),
         info={"episode_return": 0.0, "episode_length": 0, "is_terminal_step": False},
     )
-
     assert config.system.total_buffer_size % n_devices == 0, (
         f"{Fore.RED}{Style.BRIGHT}The total buffer size should be divisible "
         + "by the number of devices!{Style.RESET_ALL}"
@@ -364,9 +359,12 @@ def learner_setup(
     env_states, timesteps = jax.vmap(env.reset, in_axes=(0))(
         jnp.stack(env_keys),
     )
-    reshape_states = lambda x: x.reshape(
-        (n_devices, config.arch.update_batch_size, config.arch.num_envs) + x.shape[1:]
-    )
+
+    def reshape_states(x: chex.Array) -> chex.Array:
+        return x.reshape(
+            (n_devices, config.arch.update_batch_size, config.arch.num_envs) + x.shape[1:]
+        )
+
     # (devices, update batch size, num_envs, ...)
     env_states = jax.tree_util.tree_map(reshape_states, env_states)
     timesteps = jax.tree_util.tree_map(reshape_states, timesteps)
@@ -386,14 +384,19 @@ def learner_setup(
     key, step_key, warmup_key = jax.random.split(key, num=3)
     step_keys = jax.random.split(step_key, n_devices * config.arch.update_batch_size)
     warmup_keys = jax.random.split(warmup_key, n_devices * config.arch.update_batch_size)
-    reshape_keys = lambda x: x.reshape((n_devices, config.arch.update_batch_size) + x.shape[1:])
+
+    def reshape_keys(x: chex.Array) -> chex.Array:
+        return x.reshape((n_devices, config.arch.update_batch_size) + x.shape[1:])
+
     step_keys = reshape_keys(jnp.stack(step_keys))
     warmup_keys = reshape_keys(jnp.stack(warmup_keys))
 
     replicate_learner = (params, opt_states, buffer_states)
 
     # Duplicate learner for update_batch_size.
-    broadcast = lambda x: jnp.broadcast_to(x, (config.arch.update_batch_size,) + x.shape)
+    def broadcast(x: chex.Array) -> chex.Array:
+        return jnp.broadcast_to(x, (config.arch.update_batch_size,) + x.shape)
+
     replicate_learner = jax.tree_util.tree_map(broadcast, replicate_learner)
 
     # Duplicate learner across devices.
@@ -550,8 +553,8 @@ def run_experiment(_config: DictConfig) -> float:
 
 
 @hydra.main(
-    config_path="../../configs/default/anakin",
-    config_name="default_ff_mdqn.yaml",
+    config_path="../../../configs/default/anakin",
+    config_name="default_ff_dqn.yaml",
     version_base="1.2",
 )
 def hydra_entry_point(cfg: DictConfig) -> float:
@@ -562,7 +565,7 @@ def hydra_entry_point(cfg: DictConfig) -> float:
     # Run experiment.
     eval_performance = run_experiment(cfg)
 
-    print(f"{Fore.CYAN}{Style.BRIGHT}MDQN experiment completed{Style.RESET_ALL}")
+    print(f"{Fore.CYAN}{Style.BRIGHT}DQN experiment completed{Style.RESET_ALL}")
     return eval_performance
 
 

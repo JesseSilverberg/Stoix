@@ -2,17 +2,17 @@ import queue
 import threading
 import time
 from functools import partial
-from typing import Any, Dict, List, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Sequence, Tuple, Union
 
 import chex
 import jax
 import jax.numpy as jnp
 from colorama import Fore, Style
-from flashbax.buffers.trajectory_buffer import TrajectoryBuffer, TrajectoryBufferState
+from flashbax.buffers.trajectory_buffer import TrajectoryBufferState
 from jumanji.types import TimeStep
 
 from stoix.base_types import Parameters, StoixTransition
-from stoix.utils.rate_limiters import MinSize, RateLimiter, SampleToInsertRatio
+from stoix.utils.rate_limiters import RateLimiter
 
 
 # Copied from https://github.com/instadeepai/sebulba/blob/main/sebulba/core.py
@@ -136,18 +136,19 @@ class OffPolicyPipeline(threading.Thread):
 
     def __init__(
         self,
-        replay_buffer: TrajectoryBuffer,
+        replay_buffer_add: Callable[
+            [TrajectoryBufferState, StoixTransition], TrajectoryBufferState
+        ],
+        replay_buffer_sample: Callable[[TrajectoryBufferState, chex.PRNGKey], StoixTransition],
         buffer_state: TrajectoryBufferState,
         rate_limiter: RateLimiter,
         rng_key: chex.PRNGKey,
         learner_devices: List[jax.Device],
         lifetime: ThreadLifetime,
     ):
-
         super().__init__(name="OffPolicyPipeline")
-        self.replay_buffer = replay_buffer
-        self.replay_buffer_add = jax.jit(self.replay_buffer.add)
-        self.replay_buffer_sample = jax.jit(self.replay_buffer.sample)
+        self.replay_buffer_add = jax.jit(replay_buffer_add)
+        self.replay_buffer_sample = jax.jit(replay_buffer_sample)
         self.split_key_fn = jax.jit(jax.random.split)
         self.buffer_state = buffer_state
         self.rate_limiter = rate_limiter
@@ -197,7 +198,7 @@ class OffPolicyPipeline(threading.Thread):
         with end_condition:
             end_condition.notify()  # tell we have finish
 
-    def get(self, timeout: Union[float, None] = None) -> Tuple[StoixTransition, TimeStep, Dict]:
+    def get(self, timeout: Union[float, None] = None) -> Tuple[StoixTransition, Dict]:
         """Get a trajectory from the buffer."""
 
         self.rng_key, key = self.split_key_fn(self.rng_key)
@@ -220,10 +221,11 @@ class OffPolicyPipeline(threading.Thread):
         # split the trajectory over the learner devices
         sharded_sampled_batch = jax.tree.map(lambda x: self.shard_split_playload(x), sampled_batch)
 
-        return sharded_sampled_batch  # type: ignore
+        # TODO(edan): fix issue with timings_dict
+        return sharded_sampled_batch, {}  # type: ignore
 
-    @partial(jax.jit, static_argnums=(0,2))
-    def stack_trajectory(self, trajectory: List[StoixTransition], axis=0) -> StoixTransition:
+    @partial(jax.jit, static_argnums=(0, 2))
+    def stack_trajectory(self, trajectory: List[StoixTransition], axis: int = 0) -> StoixTransition:
         """Stack a list of parallel_env transitions into a single
         transition of shape [rollout_len, num_envs, ...]."""
         return jax.tree.map(lambda *x: jnp.stack(x, axis=axis), *trajectory)  # type: ignore
@@ -232,6 +234,10 @@ class OffPolicyPipeline(threading.Thread):
         """Split the payload over the learner devices."""
         split_payload = jnp.split(payload, len(self.learner_devices), axis=axis)
         return jax.device_put_sharded(split_payload, devices=self.learner_devices)
+
+    def clear(self) -> None:
+        """Clear the buffer."""
+        raise NotImplementedError("Clearing the buffer is not yet implemented.")
 
 
 class ParamsSource(threading.Thread):
@@ -283,62 +289,71 @@ class RecordTimeTo:
 
 
 if __name__ == "__main__":
-    import flashbax as fbx
-    # Test off-policy pipeline
-    replay_buffer = fbx.make_trajectory_buffer(128, 2, 1, 1, 1, max_length_time_axis=10000)
-    fake_transition = {"obs": jnp.ones((4)), "act": jnp.ones((1,)), "rew": jnp.ones((1,))}
-    buffer_state = replay_buffer.init(fake_transition)
-    
-    min_replay_size = 1
-    samples_per_insert = 2.0
-    samples_per_insert_tolerance_rate = 1.0
-    samples_per_insert_tolerance = samples_per_insert_tolerance_rate * samples_per_insert
-    error_buffer = min_replay_size * samples_per_insert_tolerance
-    
-    # rate_limiter = MinSize(min_replay_size)
-    rate_limiter = SampleToInsertRatio(
-        samples_per_insert=samples_per_insert,
-        min_size_to_sample=min_replay_size,
-        error_buffer=error_buffer,
-    )
-    
-    lifetime = ThreadLifetime()
-    pipeline = OffPolicyPipeline(replay_buffer, buffer_state, rate_limiter, jax.random.PRNGKey(0), [jax.devices()[0]], lifetime)
-    pipeline.start()
-    
-    
-    # Make a thread that inserts data into the pipeline
-    def insert_data():
-        for i in range(1000):
-            batched_fake_transition = jax.tree.map(lambda *x: jnp.stack(x)+i, *([fake_transition] * 128))
-            rollout_of_batched_fake_transition = [batched_fake_transition]*8
-            pipeline.put(rollout_of_batched_fake_transition, {})
-            print(f"Inserted batch {i}")
-            
-    # Make a thread that samples data from the pipeline
-    def sample_data(thread_life : ThreadLifetime):
-        i = 0
-        while not thread_life.should_stop():
-            batch = pipeline.get()
-            print(f"Sampled batch {i}")
-            i += 1
+    pass
+    # import flashbax as fbx
 
-    sample_lifetime = ThreadLifetime()
-    # Start the threads
-    insert_thread = threading.Thread(target=insert_data)
-    sample_thread = threading.Thread(target=sample_data, args=(sample_lifetime,))
-    insert_thread.start()
-    sample_thread.start()
-    
-    # Wait for the threads to finish
-    insert_thread.join()
-    
-    sample_lifetime.stop()
-    
-    sample_thread.join()
-    
-    lifetime.stop()
-    pipeline.join()
-    print("Off-policy pipeline test passed")
-    
-    
+    # # Test off-policy pipeline
+    # replay_buffer = fbx.make_trajectory_buffer(128, 2, 1, 1, 1, max_length_time_axis=10000)
+    # fake_transition = {"obs": jnp.ones((4)), "act": jnp.ones((1,)), "rew": jnp.ones((1,))}
+    # buffer_state = replay_buffer.init(fake_transition)
+
+    # min_replay_size = 1
+    # samples_per_insert = 2.0
+    # samples_per_insert_tolerance_rate = 1.0
+    # samples_per_insert_tolerance = samples_per_insert_tolerance_rate * samples_per_insert
+    # error_buffer = min_replay_size * samples_per_insert_tolerance
+
+    # # rate_limiter = MinSize(min_replay_size)
+    # rate_limiter = SampleToInsertRatio(
+    #     samples_per_insert=samples_per_insert,
+    #     min_size_to_sample=min_replay_size,
+    #     error_buffer=error_buffer,
+    # )
+
+    # lifetime = ThreadLifetime()
+    # pipeline = OffPolicyPipeline(
+    #     replay_buffer.add,
+    #     replay_buffer.sample,
+    #     buffer_state,
+    #     rate_limiter,
+    #     jax.random.PRNGKey(0),
+    #     [jax.devices()[0]],
+    #     lifetime,
+    # )
+    # pipeline.start()
+
+    # # Make a thread that inserts data into the pipeline
+    # def insert_data():
+    #     for i in range(1000):
+    #         batched_fake_transition = jax.tree.map(
+    #             lambda *x: jnp.stack(x) + i, *([fake_transition] * 128)
+    #         )
+    #         rollout_of_batched_fake_transition = [batched_fake_transition] * 8
+    #         pipeline.put(rollout_of_batched_fake_transition, {})
+    #         print(f"Inserted batch {i}")
+
+    # # Make a thread that samples data from the pipeline
+    # def sample_data(thread_life: ThreadLifetime):
+    #     i = 0
+    #     while not thread_life.should_stop():
+    #         batch = pipeline.get()
+    #         print(f"Sampled batch {i}")
+    #         i += 1
+
+    # sample_lifetime = ThreadLifetime()
+    # # Start the threads
+    # insert_thread = threading.Thread(target=insert_data)
+    # sample_thread = threading.Thread(target=sample_data, args=(sample_lifetime,))
+    # insert_thread.start()
+    # sample_thread.start()
+
+    # # Wait for the threads to finish
+    # insert_thread.join()
+
+    # sample_lifetime.stop()
+
+    # sample_thread.join()
+
+    # lifetime.stop()
+    # pipeline.join()
+    # print("Off-policy pipeline test passed")

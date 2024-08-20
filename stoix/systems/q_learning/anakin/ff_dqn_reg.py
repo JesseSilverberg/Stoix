@@ -1,21 +1,8 @@
 import copy
 import time
-from typing import TYPE_CHECKING, Any, Callable, Dict, Tuple
-
-from stoix.systems.q_learning.dqn_types import Transition
-from stoix.utils.checkpointing import Checkpointer
-from stoix.utils.jax_utils import unreplicate_batch_dim, unreplicate_n_dims
-from stoix.utils.loss import quantile_q_learning
-from stoix.utils.training import make_learning_rate
-from stoix.wrappers.episode_metrics import get_final_step_metrics
-
-if TYPE_CHECKING:
-    from dataclasses import dataclass
-else:
-    from chex import dataclass
+from typing import Any, Callable, Dict, Tuple
 
 import chex
-import distrax
 import flashbax as fbx
 import flax
 import hydra
@@ -35,15 +22,20 @@ from stoix.base_types import (
     ExperimentOutput,
     LearnerFn,
     LogEnvState,
-    Observation,
     OffPolicyLearnerState,
     OnlineAndTarget,
 )
 from stoix.evaluator import evaluator_setup, get_distribution_act_fn
 from stoix.networks.base import FeedForwardActor as Actor
+from stoix.systems.q_learning.dqn_types import Transition
 from stoix.utils import make_env as environments
+from stoix.utils.checkpointing import Checkpointer
+from stoix.utils.jax_utils import unreplicate_batch_dim, unreplicate_n_dims
 from stoix.utils.logger import LogEvent, StoixLogger
+from stoix.utils.loss import q_learning
 from stoix.utils.total_timestep_checker import check_total_timesteps
+from stoix.utils.training import make_learning_rate
+from stoix.wrappers.episode_metrics import get_final_step_metrics
 
 
 def get_warmup_fn(
@@ -64,7 +56,7 @@ def get_warmup_fn(
             env_state, last_timestep, key = carry
             # SELECT ACTION
             key, policy_key = jax.random.split(key)
-            actor_policy, _ = q_apply_fn(q_params.online, last_timestep.observation)
+            actor_policy = q_apply_fn(q_params.online, last_timestep.observation)
             action = actor_policy.sample(seed=policy_key)
 
             # STEP ENVIRONMENT
@@ -120,7 +112,7 @@ def get_learner_fn(
 
             # SELECT ACTION
             key, policy_key = jax.random.split(key)
-            actor_policy, _ = q_apply_fn(q_params.online, last_timestep.observation)
+            actor_policy = q_apply_fn(q_params.online, last_timestep.observation)
             action = actor_policy.sample(seed=policy_key)
 
             # STEP ENVIRONMENT
@@ -159,8 +151,8 @@ def get_learner_fn(
                 transitions: Transition,
             ) -> jnp.ndarray:
 
-                _, q_dist_tm1 = q_apply_fn(q_params, transitions.obs)
-                _, q_dist_t = q_apply_fn(target_q_params, transitions.next_obs)
+                q_tm1 = q_apply_fn(q_params, transitions.obs).preferences
+                q_t = q_apply_fn(target_q_params, transitions.next_obs).preferences
 
                 # Cast and clip rewards.
                 discount = 1.0 - transitions.done.astype(jnp.float32)
@@ -170,33 +162,25 @@ def get_learner_fn(
                 ).astype(jnp.float32)
                 a_tm1 = transitions.action
 
-                # Swap distribution and action dimension, since
-                # quantile_q_learning expects it that way.
-                q_dist_tm1 = jnp.swapaxes(q_dist_tm1, 1, 2)
-                q_dist_t = jnp.swapaxes(q_dist_t, 1, 2)
-                quantiles = (
-                    jnp.arange(config.system.num_quantiles, dtype=jnp.float32) + 0.5
-                ) / config.system.num_quantiles
-                quantiles = jnp.broadcast_to(
-                    quantiles, (a_tm1.shape[0], config.system.num_quantiles)
-                )
-
-                q_loss = quantile_q_learning(
-                    q_dist_tm1,
-                    quantiles,
+                # Compute Q-learning loss.
+                batch_td_loss = q_learning(
+                    q_tm1,
                     a_tm1,
                     r_t,
                     d_t,
-                    q_dist_t,  # No double Q-learning here.
-                    q_dist_t,
+                    q_t,
                     config.system.huber_loss_parameter,
                 )
 
+                q_regularizer_loss = q_tm1[jnp.arange(a_tm1.shape[0]), a_tm1].mean()
+
+                batch_loss = config.system.regularizer_coeff * q_regularizer_loss + batch_td_loss
+
                 loss_info = {
-                    "q_loss": q_loss,
+                    "q_loss": batch_loss,
                 }
 
-                return q_loss, loss_info
+                return batch_loss, loss_info
 
             params, opt_states, buffer_state, key = update_state
 
@@ -260,6 +244,7 @@ def get_learner_fn(
         This function represents the learner, it updates the network parameters
         by iteratively applying the `_update_step` function for a fixed number of
         updates. The `_update_step` function is vectorized over a batch of inputs.
+
         """
 
         batched_update_step = jax.vmap(_update_step, in_axes=(0, None), axis_name="batch")
@@ -276,17 +261,9 @@ def get_learner_fn(
     return learner_fn
 
 
-@dataclass
-class EvalActorWrapper:
-    actor: Actor
-
-    def apply(self, params: FrozenDict, x: Observation) -> distrax.EpsilonGreedy:
-        return self.actor.apply(params, x)[0]
-
-
 def learner_setup(
     env: Environment, keys: chex.Array, config: DictConfig
-) -> Tuple[LearnerFn[OffPolicyLearnerState], EvalActorWrapper, OffPolicyLearnerState]:
+) -> Tuple[LearnerFn[OffPolicyLearnerState], Actor, OffPolicyLearnerState]:
     """Initialise learner_fn, network, optimiser, environment and states."""
     # Get available TPU cores.
     n_devices = len(jax.devices())
@@ -298,7 +275,7 @@ def learner_setup(
     # PRNG keys.
     key, q_net_key = keys
 
-    # Define actor_network and optimiser.
+    # Define networks and optimiser.
     q_network_torso = hydra.utils.instantiate(config.network.actor_network.pre_torso)
     q_network_action_head = hydra.utils.instantiate(
         config.network.actor_network.action_head,
@@ -314,7 +291,6 @@ def learner_setup(
         epsilon=config.system.evaluation_epsilon,
     )
     eval_q_network = Actor(torso=q_network_torso, action_head=eval_q_network_action_head)
-    eval_q_network = EvalActorWrapper(actor=eval_q_network)
 
     q_lr = make_learning_rate(config.system.q_lr, config, config.system.epochs)
     q_optim = optax.chain(
@@ -492,7 +468,7 @@ def run_experiment(_config: DictConfig) -> float:
         )
 
     # Run experiment for a total number of evaluations.
-    max_episode_return = jnp.float32(-1e7)
+    max_episode_return = jnp.float32(-1e6)
     best_params = unreplicate_batch_dim(learner_state.params.online)
     for eval_step in range(config.arch.num_evaluation):
         # Train.
@@ -574,8 +550,8 @@ def run_experiment(_config: DictConfig) -> float:
 
 
 @hydra.main(
-    config_path="../../configs/default/anakin",
-    config_name="default_ff_qr_dqn.yaml",
+    config_path="../../../configs/default/anakin",
+    config_name="default_ff_dqn_reg.yaml",
     version_base="1.2",
 )
 def hydra_entry_point(cfg: DictConfig) -> float:
@@ -586,7 +562,7 @@ def hydra_entry_point(cfg: DictConfig) -> float:
     # Run experiment.
     eval_performance = run_experiment(cfg)
 
-    print(f"{Fore.CYAN}{Style.BRIGHT}QR-DQN experiment completed{Style.RESET_ALL}")
+    print(f"{Fore.CYAN}{Style.BRIGHT}DQN-Reg experiment completed{Style.RESET_ALL}")
     return eval_performance
 
 

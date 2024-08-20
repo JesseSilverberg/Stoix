@@ -30,17 +30,17 @@ class RateLimiter:
         """Returns the number of inserts."""
         with self.mutex:
             return self.inserts
-    
+
     def num_samples(self) -> int:
         """Returns the number of samples."""
         with self.mutex:
             return self.samples
-    
+
     def num_deletes(self) -> int:
         """Returns the number of deletes."""
         with self.mutex:
             return self.deletes
-    
+
     def insert(self) -> None:
         """Increment the number of inserts and notify all waiting threads."""
         with self.mutex:
