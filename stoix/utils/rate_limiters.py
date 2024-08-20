@@ -23,24 +23,39 @@ class RateLimiter:
         self.samples = 0
         self.deletes = 0
 
-        self.lock = threading.Lock()
-        self.condition = threading.Condition(self.lock)
+        self.mutex = threading.Lock()
+        self.condition = threading.Condition(self.mutex)
 
+    def num_inserts(self) -> int:
+        """Returns the number of inserts."""
+        with self.mutex:
+            return self.inserts
+    
+    def num_samples(self) -> int:
+        """Returns the number of samples."""
+        with self.mutex:
+            return self.samples
+    
+    def num_deletes(self) -> int:
+        """Returns the number of deletes."""
+        with self.mutex:
+            return self.deletes
+    
     def insert(self) -> None:
         """Increment the number of inserts and notify all waiting threads."""
-        with self.lock:
+        with self.mutex:
             self.inserts += 1
             self.condition.notify_all()  # Notify all waiting threads
 
     def delete(self) -> None:
         """Increment the number of deletes and notify all waiting threads."""
-        with self.lock:
+        with self.mutex:
             self.deletes += 1
             self.condition.notify_all()  # Notify all waiting threads
 
     def sample(self) -> None:
         """Increment the number of samples and notify all waiting threads."""
-        with self.lock:
+        with self.mutex:
             self.samples += 1
             self.condition.notify_all()  # Notify all waiting threads
 

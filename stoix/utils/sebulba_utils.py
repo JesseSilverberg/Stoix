@@ -12,7 +12,7 @@ from flashbax.buffers.trajectory_buffer import TrajectoryBuffer, TrajectoryBuffe
 from jumanji.types import TimeStep
 
 from stoix.base_types import Parameters, StoixTransition
-from stoix.utils.rate_limiters import RateLimiter
+from stoix.utils.rate_limiters import MinSize, RateLimiter, SampleToInsertRatio
 
 
 # Copied from https://github.com/instadeepai/sebulba/blob/main/sebulba/core.py
@@ -146,8 +146,8 @@ class OffPolicyPipeline(threading.Thread):
 
         super().__init__(name="OffPolicyPipeline")
         self.replay_buffer = replay_buffer
-        self.replay_buffer.add = jax.jit(self.replay_buffer.add)
-        self.replay_buffer.sample = jax.jit(self.replay_buffer.sample)
+        self.replay_buffer_add = jax.jit(self.replay_buffer.add)
+        self.replay_buffer_sample = jax.jit(self.replay_buffer.sample)
         self.split_key_fn = jax.jit(jax.random.split)
         self.buffer_state = buffer_state
         self.rate_limiter = rate_limiter
@@ -174,7 +174,7 @@ class OffPolicyPipeline(threading.Thread):
             start_condition.wait()  # wait to be allowed to start
 
         # [Transition(num_envs)] * rollout_len --> Transition[(rollout_len, num_envs,)
-        traj = self.stack_trajectory(traj)
+        traj = self.stack_trajectory(traj, 1)
 
         # wait until we can insert the data
         try:
@@ -189,7 +189,7 @@ class OffPolicyPipeline(threading.Thread):
             self.rate_limiter.delete()
 
         # insert the data
-        self.buffer_state = self.replay_buffer.add(self.buffer_state, traj)
+        self.buffer_state = self.replay_buffer_add(self.buffer_state, traj)
 
         # signal that we have inserted the data
         self.rate_limiter.insert()
@@ -212,7 +212,7 @@ class OffPolicyPipeline(threading.Thread):
             )
 
         # sample the data
-        sampled_batch = self.replay_buffer.sample(self.buffer_state, key)
+        sampled_batch = self.replay_buffer_sample(self.buffer_state, key)
 
         # signal that we have sampled the data
         self.rate_limiter.sample()
@@ -222,13 +222,14 @@ class OffPolicyPipeline(threading.Thread):
 
         return sharded_sampled_batch  # type: ignore
 
-    @partial(jax.jit, static_argnums=(0,))
-    def stack_trajectory(self, trajectory: List[StoixTransition]) -> StoixTransition:
+    @partial(jax.jit, static_argnums=(0,2))
+    def stack_trajectory(self, trajectory: List[StoixTransition], axis=0) -> StoixTransition:
         """Stack a list of parallel_env transitions into a single
         transition of shape [rollout_len, num_envs, ...]."""
-        return jax.tree_map(lambda *x: jnp.stack(x, axis=0), *trajectory)  # type: ignore
+        return jax.tree.map(lambda *x: jnp.stack(x, axis=axis), *trajectory)  # type: ignore
 
     def shard_split_playload(self, payload: Any, axis: int = 0) -> Any:
+        """Split the payload over the learner devices."""
         split_payload = jnp.split(payload, len(self.learner_devices), axis=axis)
         return jax.device_put_sharded(split_payload, devices=self.learner_devices)
 
@@ -279,3 +280,65 @@ class RecordTimeTo:
     def __exit__(self, *args: Any) -> None:
         end = time.monotonic()
         self.to.append(end - self.start)
+
+
+if __name__ == "__main__":
+    import flashbax as fbx
+    # Test off-policy pipeline
+    replay_buffer = fbx.make_trajectory_buffer(128, 2, 1, 1, 1, max_length_time_axis=10000)
+    fake_transition = {"obs": jnp.ones((4)), "act": jnp.ones((1,)), "rew": jnp.ones((1,))}
+    buffer_state = replay_buffer.init(fake_transition)
+    
+    min_replay_size = 1
+    samples_per_insert = 2.0
+    samples_per_insert_tolerance_rate = 1.0
+    samples_per_insert_tolerance = samples_per_insert_tolerance_rate * samples_per_insert
+    error_buffer = min_replay_size * samples_per_insert_tolerance
+    
+    # rate_limiter = MinSize(min_replay_size)
+    rate_limiter = SampleToInsertRatio(
+        samples_per_insert=samples_per_insert,
+        min_size_to_sample=min_replay_size,
+        error_buffer=error_buffer,
+    )
+    
+    lifetime = ThreadLifetime()
+    pipeline = OffPolicyPipeline(replay_buffer, buffer_state, rate_limiter, jax.random.PRNGKey(0), [jax.devices()[0]], lifetime)
+    pipeline.start()
+    
+    
+    # Make a thread that inserts data into the pipeline
+    def insert_data():
+        for i in range(1000):
+            batched_fake_transition = jax.tree.map(lambda *x: jnp.stack(x)+i, *([fake_transition] * 128))
+            rollout_of_batched_fake_transition = [batched_fake_transition]*8
+            pipeline.put(rollout_of_batched_fake_transition, {})
+            print(f"Inserted batch {i}")
+            
+    # Make a thread that samples data from the pipeline
+    def sample_data(thread_life : ThreadLifetime):
+        i = 0
+        while not thread_life.should_stop():
+            batch = pipeline.get()
+            print(f"Sampled batch {i}")
+            i += 1
+
+    sample_lifetime = ThreadLifetime()
+    # Start the threads
+    insert_thread = threading.Thread(target=insert_data)
+    sample_thread = threading.Thread(target=sample_data, args=(sample_lifetime,))
+    insert_thread.start()
+    sample_thread.start()
+    
+    # Wait for the threads to finish
+    insert_thread.join()
+    
+    sample_lifetime.stop()
+    
+    sample_thread.join()
+    
+    lifetime.stop()
+    pipeline.join()
+    print("Off-policy pipeline test passed")
+    
+    
