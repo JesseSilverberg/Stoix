@@ -4,12 +4,15 @@ import time
 from functools import partial
 from typing import Any, Dict, List, Sequence, Tuple, Union
 
+import chex
 import jax
 import jax.numpy as jnp
 from colorama import Fore, Style
+from flashbax.buffers.trajectory_buffer import TrajectoryBuffer, TrajectoryBufferState
 from jumanji.types import TimeStep
 
 from stoix.base_types import Parameters, StoixTransition
+from stoix.utils.rate_limiters import RateLimiter
 
 
 # Copied from https://github.com/instadeepai/sebulba/blob/main/sebulba/core.py
@@ -28,7 +31,7 @@ class ThreadLifetime:
 
 class OnPolicyPipeline(threading.Thread):
     """
-    The `Pipeline` shards trajectories into `learner_devices`,
+    The `OnPolicyPipeline` shards trajectories into `learner_devices`,
     ensuring trajectories are consumed in the right order to avoid being off-policy
     and limit the max number of samples in device memory at one time to avoid OOM issues.
     """
@@ -41,7 +44,7 @@ class OnPolicyPipeline(threading.Thread):
             max_size: The maximum number of trajectories to keep in the pipeline.
             learner_devices: The devices to shard trajectories across.
         """
-        super().__init__(name="Pipeline")
+        super().__init__(name="OnPolicyPipeline")
         self.learner_devices = learner_devices
         self.tickets_queue: queue.Queue = queue.Queue()
         self._queue: queue.Queue = queue.Queue(maxsize=max_size)
@@ -123,6 +126,111 @@ class OnPolicyPipeline(threading.Thread):
         """Clear the pipeline."""
         while not self._queue.empty():
             self._queue.get()
+
+
+class OffPolicyPipeline(threading.Thread):
+    """
+    The `OffPolicyPipeline` shards sampled batches from a replay buffer into `learner_devices`,
+    ensuring batches are consumed in-line with the replay buffer's sampling rate.
+    """
+
+    def __init__(
+        self,
+        replay_buffer: TrajectoryBuffer,
+        buffer_state: TrajectoryBufferState,
+        rate_limiter: RateLimiter,
+        rng_key: chex.PRNGKey,
+        learner_devices: List[jax.Device],
+        lifetime: ThreadLifetime,
+    ):
+
+        super().__init__(name="OffPolicyPipeline")
+        self.replay_buffer = replay_buffer
+        self.replay_buffer.add = jax.jit(self.replay_buffer.add)
+        self.replay_buffer.sample = jax.jit(self.replay_buffer.sample)
+        self.split_key_fn = jax.jit(jax.random.split)
+        self.buffer_state = buffer_state
+        self.rate_limiter = rate_limiter
+        self.rng_key = rng_key
+        self.learner_devices = learner_devices
+        self.tickets_queue: queue.Queue = queue.Queue()
+        self.lifetime = lifetime
+
+    def run(self) -> None:
+        while not self.lifetime.should_stop():
+            try:
+                start_condition, end_condition = self.tickets_queue.get(timeout=1)
+                with end_condition:
+                    with start_condition:
+                        start_condition.notify()
+                    end_condition.wait()
+            except queue.Empty:
+                continue
+
+    def put(self, traj: Sequence[StoixTransition], timings_dict: Dict) -> None:
+        start_condition, end_condition = (threading.Condition(), threading.Condition())
+        with start_condition:
+            self.tickets_queue.put((start_condition, end_condition))
+            start_condition.wait()  # wait to be allowed to start
+
+        # [Transition(num_envs)] * rollout_len --> Transition[(rollout_len, num_envs,)
+        traj = self.stack_trajectory(traj)
+
+        # wait until we can insert the data
+        try:
+            self.rate_limiter.await_can_insert(timeout=180)
+        except TimeoutError:
+            print(
+                f"{Fore.RED}{Style.BRIGHT}Actor has timed out on insertion, "
+                f"this should not happen. A deadlock might be occurring{Style.RESET_ALL}"
+            )
+
+        if self.buffer_state.is_full:
+            self.rate_limiter.delete()
+
+        # insert the data
+        self.buffer_state = self.replay_buffer.add(self.buffer_state, traj)
+
+        # signal that we have inserted the data
+        self.rate_limiter.insert()
+
+        with end_condition:
+            end_condition.notify()  # tell we have finish
+
+    def get(self, timeout: Union[float, None] = None) -> Tuple[StoixTransition, TimeStep, Dict]:
+        """Get a trajectory from the buffer."""
+
+        self.rng_key, key = self.split_key_fn(self.rng_key)
+
+        # wait until we can sample the data
+        try:
+            self.rate_limiter.await_can_sample(timeout=timeout)
+        except TimeoutError:
+            print(
+                f"{Fore.RED}{Style.BRIGHT}Learner has timed out on sampling, "
+                f"this should not happen. A deadlock might be occurring{Style.RESET_ALL}"
+            )
+
+        # sample the data
+        sampled_batch = self.replay_buffer.sample(self.buffer_state, key)
+
+        # signal that we have sampled the data
+        self.rate_limiter.sample()
+
+        # split the trajectory over the learner devices
+        sharded_sampled_batch = jax.tree.map(lambda x: self.shard_split_playload(x), sampled_batch)
+
+        return sharded_sampled_batch  # type: ignore
+
+    @partial(jax.jit, static_argnums=(0,))
+    def stack_trajectory(self, trajectory: List[StoixTransition]) -> StoixTransition:
+        """Stack a list of parallel_env transitions into a single
+        transition of shape [rollout_len, num_envs, ...]."""
+        return jax.tree_map(lambda *x: jnp.stack(x, axis=0), *trajectory)  # type: ignore
+
+    def shard_split_playload(self, payload: Any, axis: int = 0) -> Any:
+        split_payload = jnp.split(payload, len(self.learner_devices), axis=axis)
+        return jax.device_put_sharded(split_payload, devices=self.learner_devices)
 
 
 class ParamsSource(threading.Thread):

@@ -1,7 +1,7 @@
 import logging
 import sys
 import threading
-from typing import Tuple, Union
+from typing import Optional, Tuple, Union
 
 # Taken and modified
 # from https://github.com/google-deepmind/reverb/blob/master/reverb/rate_limiters.py
@@ -27,21 +27,25 @@ class RateLimiter:
         self.condition = threading.Condition(self.lock)
 
     def insert(self) -> None:
+        """Increment the number of inserts and notify all waiting threads."""
         with self.lock:
             self.inserts += 1
             self.condition.notify_all()  # Notify all waiting threads
 
     def delete(self) -> None:
+        """Increment the number of deletes and notify all waiting threads."""
         with self.lock:
             self.deletes += 1
             self.condition.notify_all()  # Notify all waiting threads
 
     def sample(self) -> None:
+        """Increment the number of samples and notify all waiting threads."""
         with self.lock:
             self.samples += 1
             self.condition.notify_all()  # Notify all waiting threads
 
     def can_insert(self, num_inserts: int) -> bool:
+        """Check if the caller can insert `num_inserts` items."""
         # Assume lock is already held by the caller
         if num_inserts <= 0:
             return False
@@ -51,6 +55,7 @@ class RateLimiter:
         return diff <= self.max_diff
 
     def can_sample(self, num_samples: int) -> bool:
+        """Check if the caller can sample `num_samples` items."""
         # Assume lock is already held by the caller
         if num_samples <= 0:
             return False
@@ -59,15 +64,21 @@ class RateLimiter:
         diff = self.inserts * self.samples_per_insert - self.samples - num_samples
         return diff >= self.min_diff
 
-    def await_can_insert(self, num_inserts: int) -> None:
+    def await_can_insert(self, num_inserts: int = 1, timeout: Optional[float] = None) -> bool:
+        """Wait until the caller can insert `num_inserts` items."""
         with self.condition:
-            while not self.can_insert(num_inserts):
-                self.condition.wait()  # Wait until the condition is met
+            result = self.condition.wait_for(lambda: self.can_insert(num_inserts), timeout)
+            if not result:
+                raise TimeoutError(f"Timeout occurred while waiting to insert {num_inserts} items.")
+            return result
 
-    def await_can_sample(self, num_samples: int) -> None:
+    def await_can_sample(self, num_samples: int = 1, timeout: Optional[float] = None) -> bool:
+        """Wait until the caller can sample `num_samples` items."""
         with self.condition:
-            while not self.can_sample(num_samples):
-                self.condition.wait()  # Wait until the condition is met
+            result = self.condition.wait_for(lambda: self.can_sample(num_samples), timeout)
+            if not result:
+                raise TimeoutError(f"Timeout occurred while waiting to sample {num_samples} items.")
+            return result
 
     def __repr__(self) -> str:
         return (
@@ -77,40 +88,7 @@ class RateLimiter:
         )
 
 
-class BaseRateLimiter:
-    """Base class for RateLimiters."""
-
-    def __init__(
-        self, samples_per_insert: float, min_size_to_sample: int, min_diff: float, max_diff: float
-    ):
-        self._samples_per_insert = samples_per_insert
-        self._min_size_to_sample = min_size_to_sample
-        self._min_diff = min_diff
-        self._max_diff = max_diff
-        self._internal_limiter = RateLimiter(
-            samples_per_insert=samples_per_insert,
-            min_size_to_sample=min_size_to_sample,
-            min_diff=min_diff,
-            max_diff=max_diff,
-        )
-
-    def __repr__(self) -> str:
-        return repr(self._internal_limiter)
-
-    def insert(self) -> None:
-        self._internal_limiter.insert()
-
-    def sample(self) -> None:
-        self._internal_limiter.sample()
-
-    def await_can_insert(self, num_inserts: int = 1) -> None:
-        self._internal_limiter.await_can_insert(num_inserts)
-
-    def await_can_sample(self, num_samples: int = 1) -> None:
-        self._internal_limiter.await_can_sample(num_samples)
-
-
-class MinSize(BaseRateLimiter):
+class MinSize(RateLimiter):
     """Block sample calls unless replay contains `min_size_to_sample`.
 
     This limiter blocks all sample calls when the replay contains less than
@@ -120,7 +98,7 @@ class MinSize(BaseRateLimiter):
     def __init__(self, min_size_to_sample: int):
         if min_size_to_sample < 1:
             raise ValueError(
-                f"min_size_to_sample ({min_size_to_sample}) must be a positive " f"integer"
+                f"min_size_to_sample ({min_size_to_sample}) must be a positive integer"
             )
 
         super().__init__(
@@ -131,7 +109,7 @@ class MinSize(BaseRateLimiter):
         )
 
 
-class SampleToInsertRatio(BaseRateLimiter):
+class SampleToInsertRatio(RateLimiter):
     """Maintains a specified ratio between samples and inserts.
 
     The limiter works in two stages:
@@ -225,7 +203,7 @@ class SampleToInsertRatio(BaseRateLimiter):
 
         if min_size_to_sample < 1:
             raise ValueError(
-                f"min_size_to_sample ({min_size_to_sample}) must be a positive " f"integer"
+                f"min_size_to_sample ({min_size_to_sample}) must be a positive integer"
             )
 
         super().__init__(
@@ -237,31 +215,41 @@ class SampleToInsertRatio(BaseRateLimiter):
 
 
 if __name__ == "__main__":
-    pass
-    # rate_lim = SampleToInsertRatio(
-    #     samples_per_insert=1.0, min_size_to_sample=32, error_buffer=32.0
-    # )
+    # Example usage:
+    min_replay_size = 32
+    samples_per_insert = 32
+    samples_per_insert_tolerance_rate = 0.1
+    samples_per_insert_tolerance = samples_per_insert_tolerance_rate * samples_per_insert
+    error_buffer = min_replay_size * samples_per_insert_tolerance
+    rate_lim = SampleToInsertRatio(
+        samples_per_insert=samples_per_insert,
+        min_size_to_sample=min_replay_size,
+        error_buffer=error_buffer,
+    )
     # rate_lim = MinSize(
-    #     min_size_to_sample=100,
+    #     min_size_to_sample=min_replay_size
     # )
 
-    # def insert_thread(rate_limiter):
-    #     for i in range(132):
-    #         rate_limiter.await_can_insert(1)
-    #         rate_limiter.insert()
-    #         print(f"Inserted {i+1}")
+    num_inserts = 1000
+    num_samples = num_inserts * samples_per_insert + samples_per_insert
 
-    # def sample_thread(rate_limiter):
-    #     for i in range(100):
-    #         rate_limiter.await_can_sample(1)
-    #         rate_limiter.sample()
-    #         print(f"Sampled {i+1}")
+    def insert_thread_fn(rate_limiter: RateLimiter) -> None:
+        for i in range(num_inserts):
+            rate_limiter.await_can_insert(1)
+            rate_limiter.insert()
+            print(f"Inserted {i+1}")
 
-    # insert_thread = threading.Thread(target=insert_thread, args=(rate_lim,))
-    # sample_thread = threading.Thread(target=sample_thread, args=(rate_lim,))
+    def sample_thread_fn(rate_limiter: RateLimiter) -> None:
+        for i in range(num_samples):
+            rate_limiter.await_can_sample(1)
+            rate_limiter.sample()
+            print(f"Sampled {i+1}")
 
-    # insert_thread.start()
-    # sample_thread.start()
+    insert_thread = threading.Thread(target=insert_thread_fn, args=(rate_lim,))
+    sample_thread = threading.Thread(target=sample_thread_fn, args=(rate_lim,))
 
-    # insert_thread.join()
-    # sample_thread.join()
+    insert_thread.start()
+    sample_thread.start()
+
+    sample_thread.join()
+    insert_thread.join()
