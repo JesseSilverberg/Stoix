@@ -147,10 +147,12 @@ class OffPolicyPipeline(threading.Thread):
         lifetime: ThreadLifetime,
     ):
         super().__init__(name="OffPolicyPipeline")
-        self.replay_buffer_add = jax.jit(replay_buffer_add)
-        self.replay_buffer_sample = jax.jit(replay_buffer_sample)
-        self.split_key_fn = jax.jit(jax.random.split)
-        self.buffer_state = buffer_state
+        self.cpu = jax.devices("cpu")[0]
+        self.move_to_device = lambda tree: jax.tree.map(lambda x: jax.device_put(x, self.cpu), tree)
+        self.replay_buffer_add = jax.jit(replay_buffer_add, device=self.cpu)
+        self.replay_buffer_sample = jax.jit(replay_buffer_sample, device=self.cpu)
+        self.split_key_fn = jax.jit(jax.random.split, device=self.cpu)
+        self.buffer_state = self.move_to_device(buffer_state)
         self.rate_limiter = rate_limiter
         self.rng_key = rng_key
         self.learner_devices = learner_devices
@@ -190,6 +192,7 @@ class OffPolicyPipeline(threading.Thread):
             self.rate_limiter.delete()
 
         # insert the data
+        traj = self.move_to_device(traj)
         self.buffer_state = self.replay_buffer_add(self.buffer_state, traj)
 
         # signal that we have inserted the data

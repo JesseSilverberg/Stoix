@@ -20,12 +20,13 @@ class EnvPoolToJumanji:
         self.obs_shape = obs.shape[1:]
         self.num_actions = self.env.action_space.n
         self._default_action_mask = np.ones((self.num_envs, self.num_actions), dtype=np.float32)
-
+        
         # Create the metrics
         self.running_count_episode_return = np.zeros(self.num_envs, dtype=float)
         self.running_count_episode_length = np.zeros(self.num_envs, dtype=int)
         self.episode_return = np.zeros(self.num_envs, dtype=float)
         self.episode_length = np.zeros(self.num_envs, dtype=int)
+        
 
         # See if the env has lives - Atari specific
         info = self.env.step(np.zeros(self.num_envs, dtype=int))[-1]
@@ -141,7 +142,7 @@ class EnvPoolToJumanji:
 
     def _format_observation(self, obs: NDArray, info: Dict) -> Observation:
         action_mask = self._default_action_mask
-        return Observation(agent_view=obs, action_mask=action_mask)
+        return Observation(agent_view=obs, action_mask=action_mask, step_count=self.running_count_episode_length)
 
     def _create_timestep(
         self, obs: NDArray, ep_done: NDArray, terminated: NDArray, rewards: NDArray, info: Dict

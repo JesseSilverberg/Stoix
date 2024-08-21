@@ -6,6 +6,7 @@ from collections import defaultdict
 from queue import Queue
 from typing import Callable, Dict, List, Sequence, Tuple
 
+from flashbax.buffers.trajectory_buffer import TrajectoryBufferSample
 import chex
 import flashbax as fbx
 import flax
@@ -288,9 +289,9 @@ def get_learner_step_fn(
         return learner_state, (metric, loss_info)
 
     def learner_fn(
-        learner_state: CoreOffPolicyLearnerState, batch: Transition
+        learner_state: CoreOffPolicyLearnerState, batch: TrajectoryBufferSample[Transition]
     ) -> ExperimentOutput[CoreOffPolicyLearnerState]:
-
+        batch = batch.experience
         learner_state, (episode_info, loss_info) = _update_step(learner_state, batch)
 
         return ExperimentOutput(
@@ -326,7 +327,7 @@ def get_learner_rollout_fn(
                 # Get the trajectory batch from the pipeline
                 # This is blocking so it will wait until the pipeline has data.
                 with RecordTimeTo(learn_timings["rollout_get_time"]):
-                    traj_batch, rollout_time = pipeline.get(block=True)  # type: ignore
+                    traj_batch, rollout_time = pipeline.get()  # type: ignore
 
                 # We then call the update function to update the networks
                 with RecordTimeTo(learn_timings["learning_time"]):
@@ -471,9 +472,9 @@ def learner_setup(
     )
 
     buffer_fn = fbx.make_item_buffer(
-        max_length=config.system.buffer_size,
-        min_length=config.system.batch_size,
-        sample_batch_size=config.system.batch_size,
+        max_length=config.system.total_buffer_size,
+        min_length=config.system.total_batch_size,
+        sample_batch_size=config.system.total_batch_size,
         add_batches=True,
         add_sequences=True,
     )
@@ -582,7 +583,7 @@ def run_experiment(_config: DictConfig) -> float:
     learn_step, apply_fns, learner_state, buffer_fns, buffer_states = learner_setup(
         env_factory, (key, q_net_key), local_learner_devices, config
     )
-    _, eval_q_apply_fn = apply_fns
+    q_apply_fn, eval_q_apply_fn = apply_fns
     eval_act_fn = get_distribution_act_fn(config, eval_q_apply_fn)
     # Setup evaluator.
     evaluator, evaluator_envs = get_sebulba_eval_fn(
@@ -655,7 +656,7 @@ def run_experiment(_config: DictConfig) -> float:
                 actor_device,
                 params_source,
                 pipeline,
-                apply_fns,
+                q_apply_fn,
                 actors_key,
                 config,
                 seeds,
@@ -688,12 +689,13 @@ def run_experiment(_config: DictConfig) -> float:
         timings_dict["timestep"] = t
         logger.log(timings_dict, t, eval_step, LogEvent.MISC)
 
-        episode_metrics, ep_completed = get_final_step_metrics(episode_metrics)
-        episode_metrics["steps_per_second"] = (
-            steps_per_rollout / timings_dict["single_rollout_time"]
-        )
-        if ep_completed:
-            logger.log(episode_metrics, t, eval_step, LogEvent.ACT)
+        # TODO (edan): rework the way training metrics are returned
+        # episode_metrics, ep_completed = get_final_step_metrics(episode_metrics)
+        # episode_metrics["steps_per_second"] = (
+        #     steps_per_rollout / timings_dict["single_rollout_time"]
+        # )
+        # if ep_completed:
+        #     logger.log(episode_metrics, t, eval_step, LogEvent.ACT)
 
         logger.log(train_metrics, t, eval_step, LogEvent.TRAIN)
 
