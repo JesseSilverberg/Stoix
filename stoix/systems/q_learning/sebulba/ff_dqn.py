@@ -38,7 +38,7 @@ from stoix.utils.checkpointing import Checkpointer
 from stoix.utils.env_factory import EnvFactory
 from stoix.utils.logger import LogEvent, StoixLogger
 from stoix.utils.loss import q_learning
-from stoix.utils.rate_limiters import MinSize
+from stoix.utils.rate_limiters import MinSize, SampleToInsertRatio
 from stoix.utils.sebulba_utils import (
     OffPolicyPipeline,
     ParamsSource,
@@ -617,9 +617,15 @@ def run_experiment(_config: DictConfig) -> float:
     # First we create the lifetime so we can stop the pipeline when we want
     pipeline_lifetime = ThreadLifetime()
     # Now we create the pipeline
-    # TODO(edan): do this properly
     replay_buffer_add, replay_buffer_sample = buffer_fns
-    rate_limiter = MinSize(1)
+    # Set up the rate limiter that controls how actors and learners interact with the pipeline
+    if config.system.samples_to_insert > 1:
+        samples_per_insert_tolerance_rate = config.system.samples_per_insert_tolerance_rate
+        samples_per_insert_tolerance = samples_per_insert_tolerance_rate * config.system.samples_to_insert
+        error_buffer = config.system.min_replay_size * samples_per_insert_tolerance
+        rate_limiter = SampleToInsertRatio(config.system.replay_ratio, config.system.min_replay_size, error_buffer)
+    else:
+        rate_limiter = MinSize(config.system.min_replay_size)
     pipeline = OffPolicyPipeline(
         replay_buffer_add,
         replay_buffer_sample,

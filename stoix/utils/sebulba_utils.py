@@ -65,7 +65,7 @@ class OnPolicyPipeline(threading.Thread):
             except queue.Empty:
                 continue
 
-    def put(self, traj: Sequence[StoixTransition], timestep: TimeStep, timings_dict: Dict) -> None:
+    def put(self, traj: Sequence[StoixTransition], timestep: TimeStep, timings_dict: Dict[str, List[float]]) -> None:
         """Put a trajectory on the queue to be consumed by the learner."""
         start_condition, end_condition = (threading.Condition(), threading.Condition())
         with start_condition:
@@ -157,6 +157,7 @@ class OffPolicyPipeline(threading.Thread):
         self.rng_key = rng_key
         self.learner_devices = learner_devices
         self.tickets_queue: queue.Queue = queue.Queue()
+        self._timings_queue: queue.Queue = queue.Queue()
         self.lifetime = lifetime
 
     def run(self) -> None:
@@ -176,7 +177,7 @@ class OffPolicyPipeline(threading.Thread):
             self.tickets_queue.put((start_condition, end_condition))
             start_condition.wait()  # wait to be allowed to start
 
-        # [Transition(num_envs)] * rollout_len --> Transition[(rollout_len, num_envs,)
+        # [Transition(num_envs)] * rollout_len --> Transition[(num_envs, rollout_len, ...)]
         traj = self.stack_trajectory(traj, 1)
 
         # wait until we can insert the data
@@ -197,6 +198,9 @@ class OffPolicyPipeline(threading.Thread):
 
         # signal that we have inserted the data
         self.rate_limiter.insert()
+        
+        # add timings to the timings queue
+        self._timings_queue.put(timings_dict)
 
         with end_condition:
             end_condition.notify()  # tell we have finish
@@ -223,9 +227,13 @@ class OffPolicyPipeline(threading.Thread):
 
         # split the trajectory over the learner devices
         sharded_sampled_batch = jax.tree.map(lambda x: self.shard_split_playload(x), sampled_batch)
-
-        # TODO(edan): fix issue with timings_dict
-        return sharded_sampled_batch, {}  # type: ignore
+        
+        # get all timings from the timings queue and concatenate them
+        # TODO(edan): investigate speed of this
+        timings_list = self.get_all_timings()
+        timings_dict = self.stack_timings(timings_list)
+        
+        return sharded_sampled_batch, timings_dict  # type: ignore
 
     @partial(jax.jit, static_argnums=(0, 2))
     def stack_trajectory(self, trajectory: List[StoixTransition], axis: int = 0) -> StoixTransition:
@@ -238,6 +246,18 @@ class OffPolicyPipeline(threading.Thread):
         split_payload = jnp.split(payload, len(self.learner_devices), axis=axis)
         return jax.device_put_sharded(split_payload, devices=self.learner_devices)
 
+    def get_all_timings(self) -> List[Dict]:
+        """Get all timings from the timings queue."""
+        timings = []
+        while not self._timings_queue.empty():
+            timings.append(self._timings_queue.get())
+        return timings
+    
+    @partial(jax.jit, static_argnums=(0,))
+    def stack_timings(self, timings: List[Dict]) -> Dict:
+        """Stack a list of timings dictionaries into a single dictionary."""
+        return jax.tree_map(lambda *x: jnp.stack(jnp.asarray(x)), *timings)
+    
     def clear(self) -> None:
         """Clear the buffer."""
         raise NotImplementedError("Clearing the buffer is not yet implemented.")
@@ -280,7 +300,8 @@ class ParamsSource(threading.Thread):
 
 
 class RecordTimeTo:
-    def __init__(self, to: Any):
+    """Context manager to record the time taken to reach a certain point in the code."""
+    def __init__(self, to: List[float]):
         self.to = to
 
     def __enter__(self) -> None:
