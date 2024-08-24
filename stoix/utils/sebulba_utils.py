@@ -223,6 +223,9 @@ class OffPolicyPipeline(threading.Thread):
 
         # signal that we have inserted the data
         self.rate_limiter.insert()
+        
+        # Concatenate metrics - List[Dict[str, List[float]]] --> Dict[str, List[float]]
+        actor_episode_metrics = self.concatenate_metrics(actor_episode_metrics)
 
         # add timings to the timings queue
         self._metrics_queue.put((actor_timings_dict, actor_episode_metrics))
@@ -253,11 +256,8 @@ class OffPolicyPipeline(threading.Thread):
         # split the trajectory over the learner devices
         sharded_sampled_batch = jax.tree.map(lambda x: self.shard_split_playload(x), sampled_batch)
 
-        # Get all metrics from the metrics queue and concatenate them
-        # TODO(edan): investigate speed of this
-        actor_timings, actor_metrics = self.get_all_metrics()
-        actor_timings = self.stack_metrics(actor_timings)
-        actor_metrics = self.stack_metrics(actor_metrics)
+        # Get the timings and metrics from the metrics queue
+        actor_timings, actor_metrics = self._metrics_queue.get()
 
         return sharded_sampled_batch, actor_timings, actor_metrics  # type: ignore
 
@@ -271,22 +271,13 @@ class OffPolicyPipeline(threading.Thread):
         """Split the payload over the learner devices."""
         split_payload = jnp.split(payload, len(self.learner_devices), axis=axis)
         return jax.device_put_sharded(split_payload, devices=self.learner_devices)
-
-    def get_all_metrics(self) -> Tuple[List[Dict], List[Dict]]:
-        """Get all metrics from the metrics queue."""
-        actor_timings = []
-        actor_metrics = []
-        while not self._metrics_queue.empty():
-            actor_timings_dict, actor_episode_metrics = self._metrics_queue.get()
-            actor_timings.append(actor_timings_dict)
-            actor_metrics.append(actor_episode_metrics)
-        return actor_timings, actor_metrics
-
+    
     @partial(jax.jit, static_argnums=(0,))
-    def stack_metrics(self, metrics: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Stack a list of timings dictionaries into a single dictionary."""
-        metrics: Dict[str, Any] = jax.tree_map(lambda *x: jnp.stack(jnp.asarray(x)), *metrics)
-        return metrics
+    def concatenate_metrics(
+        self, actor_metrics: List[Dict[str, List[float]]]
+    ) -> Dict[str, List[float]]:
+        """Concatenate a list of actor metrics into a single dictionary."""
+        return jax.tree_map(lambda *x: jnp.concatenate(x, axis=0), *actor_metrics)  # type: ignore
 
     def clear(self) -> None:
         """Clear the buffer."""

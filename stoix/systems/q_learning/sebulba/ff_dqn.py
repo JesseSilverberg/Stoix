@@ -623,17 +623,18 @@ def run_experiment(_config: DictConfig) -> float:
     # Now we create the pipeline
     replay_buffer_add, replay_buffer_sample = buffer_fns
     # Set up the rate limiter that controls how actors and learners interact with the pipeline
-    if config.arch.pipeline.samples_per_insert > 1:
+    if config.system.epochs > 0:
         samples_per_insert_tolerance_rate = config.arch.pipeline.samples_per_insert_tolerance_rate
         samples_per_insert_tolerance = (
-            samples_per_insert_tolerance_rate * config.arch.pipeline.samples_per_insert
+            samples_per_insert_tolerance_rate * config.system.epochs
         )
         error_buffer = config.arch.pipeline.min_replay_size * samples_per_insert_tolerance
         rate_limiter = SampleToInsertRatio(
             config.system.epochs, config.arch.pipeline.min_replay_size, error_buffer
         )
     else:
-        rate_limiter = MinSize(config.arch.pipeline.min_replay_size)  # type: ignore
+        pass
+    rate_limiter = MinSize(config.arch.pipeline.min_replay_size)  # type: ignore
     pipeline = OffPolicyPipeline(
         replay_buffer_add,
         replay_buffer_sample,
@@ -747,7 +748,6 @@ def run_experiment(_config: DictConfig) -> float:
     for actor in actor_threads:
         # We clear the pipeline before stopping each actor thread
         # since actors can be blocked on the pipeline
-        pipeline.clear()
         actor.join()
 
     print(f"{Fore.MAGENTA}{Style.BRIGHT}Closing pipeline...{Style.RESET_ALL}")
