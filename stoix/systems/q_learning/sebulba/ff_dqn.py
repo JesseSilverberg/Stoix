@@ -6,7 +6,6 @@ from collections import defaultdict
 from queue import Queue
 from typing import Callable, Dict, List, Sequence, Tuple
 
-from flashbax.buffers.trajectory_buffer import TrajectoryBufferSample
 import chex
 import flashbax as fbx
 import flax
@@ -16,6 +15,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 from colorama import Fore, Style
+from flashbax.buffers.trajectory_buffer import BufferState, TrajectoryBufferSample
 from flax.core.frozen_dict import FrozenDict
 from flax.jax_utils import unreplicate
 from omegaconf import DictConfig, OmegaConf
@@ -25,9 +25,9 @@ from stoix.base_types import (
     ActorApply,
     CoreOffPolicyLearnerState,
     CriticApply,
-    ExperimentOutput,
     Observation,
     OnlineAndTarget,
+    SebulbaExperimentOutput,
     SebulbaLearnerFn,
 )
 from stoix.evaluator import get_distribution_act_fn, get_sebulba_eval_fn
@@ -103,17 +103,18 @@ def get_rollout_fn(
                 # Create the list to store transitions
                 traj: List[Transition] = []
                 # Create the dictionary to store timings for metrics
-                timings_dict: Dict[str, List[float]] = defaultdict(list)
+                actor_timings_dict: Dict[str, List[float]] = defaultdict(list)
+                episode_metrics: List[Dict[str, List[float]]] = []
                 # Rollout the environment
-                with RecordTimeTo(timings_dict["single_rollout_time"]):
+                with RecordTimeTo(actor_timings_dict["single_rollout_time"]):
                     # Loop until the rollout length is reached
                     for _ in range(config.system.rollout_length):
                         # Get the latest parameters from the source
-                        with RecordTimeTo(timings_dict["get_params_time"]):
+                        with RecordTimeTo(actor_timings_dict["get_params_time"]):
                             params = params_source.get()
 
                         # Run the actor and critic networks to get the action, value and log_prob
-                        with RecordTimeTo(timings_dict["compute_action_time"]):
+                        with RecordTimeTo(actor_timings_dict["compute_action_time"]):
                             rng_key, policy_key = split_key_fn(rng_key)
                             action = act_fn(params, cached_obs, policy_key)
 
@@ -121,7 +122,7 @@ def get_rollout_fn(
                         action_cpu = np.asarray(jax.device_put(action, cpu))
 
                         # Step the environment
-                        with RecordTimeTo(timings_dict["env_step_time"]):
+                        with RecordTimeTo(actor_timings_dict["env_step_time"]):
                             timestep = envs.step(action_cpu)
 
                         # Get the next dones and truncation flags
@@ -138,7 +139,6 @@ def get_rollout_fn(
                         # Append PPOTransition to the trajectory list
                         reward = timestep.reward
                         metrics = timestep.extras["metrics"]
-
                         traj.append(
                             Transition(
                                 cached_obs,
@@ -149,13 +149,14 @@ def get_rollout_fn(
                                 metrics,
                             )
                         )
+                        episode_metrics.append(metrics)
                         # Update the cached observations
                         cached_obs = cached_next_obs
 
                 # Send the trajectory to the pipeline
-                with RecordTimeTo(timings_dict["rollout_put_time"]):
+                with RecordTimeTo(actor_timings_dict["rollout_put_time"]):
                     try:
-                        pipeline.put(traj, timings_dict)
+                        pipeline.put(traj, actor_timings_dict, episode_metrics)
                     except queue.Full:
                         warnings.warn(
                             "Waited too long to add to the rollout queue, killing the actor thread",
@@ -214,7 +215,7 @@ def get_learner_step_fn(
 
     def _update_step(
         learner_state: CoreOffPolicyLearnerState, batch: Transition
-    ) -> Tuple[CoreOffPolicyLearnerState, Tuple]:
+    ) -> Tuple[CoreOffPolicyLearnerState, Dict[str, chex.Array]]:
 
         # Unpack learner state.
         params, opt_states, key = learner_state
@@ -284,19 +285,16 @@ def get_learner_step_fn(
             **q_loss_info,
         }
 
-        # TODO (edan): rework the way training metrics are returned
-        metric = {}
-        return learner_state, (metric, loss_info)
+        return learner_state, loss_info
 
     def learner_fn(
         learner_state: CoreOffPolicyLearnerState, batch: TrajectoryBufferSample[Transition]
-    ) -> ExperimentOutput[CoreOffPolicyLearnerState]:
+    ) -> SebulbaExperimentOutput[CoreOffPolicyLearnerState]:
         batch = batch.experience
-        learner_state, (episode_info, loss_info) = _update_step(learner_state, batch)
+        learner_state, loss_info = _update_step(learner_state, batch)
 
-        return ExperimentOutput(
+        return SebulbaExperimentOutput(
             learner_state=learner_state,
-            episode_metrics=episode_info,
             train_metrics=loss_info,
         )
 
@@ -320,24 +318,22 @@ def get_learner_rollout_fn(
         for _ in range(config.arch.num_evaluation):
             # Create the lists to store metrics and timings for this learning iteration.
             metrics: List[Tuple[Dict, Dict]] = []
-            rollout_times: List[Dict] = []
-            learn_timings: Dict[str, List[float]] = defaultdict(list)
+            actor_timings: List[Dict] = []
+            learner_timings: Dict[str, List[float]] = defaultdict(list)
             # Loop for the number of updates per evaluation
             for _ in range(config.arch.num_updates_per_eval):
                 # Get the trajectory batch from the pipeline
                 # This is blocking so it will wait until the pipeline has data.
-                with RecordTimeTo(learn_timings["rollout_get_time"]):
-                    traj_batch, rollout_time = pipeline.get()  # type: ignore
+                with RecordTimeTo(learner_timings["rollout_get_time"]):
+                    traj_batch, actor_times, episode_metrics = pipeline.get()  # type: ignore
 
                 # We then call the update function to update the networks
-                with RecordTimeTo(learn_timings["learning_time"]):
-                    learner_state, episode_metrics, train_metrics = learn_step(
-                        learner_state, traj_batch
-                    )
+                with RecordTimeTo(learner_timings["learning_time"]):
+                    learner_state, train_metrics = learn_step(learner_state, traj_batch)
 
                 # We store the metrics and timings for this update
                 metrics.append((episode_metrics, train_metrics))
-                rollout_times.append(rollout_time)
+                actor_timings.append(actor_times)
 
                 # After the update we need to update the params sources with the new params
                 unreplicated_params = unreplicate(learner_state.params)
@@ -350,8 +346,8 @@ def get_learner_rollout_fn(
             # and timings to the evaluation queue. This is so the evaluator correctly evaluates
             # the performance of the networks at this point in time.
             episode_metrics, train_metrics = jax.tree.map(lambda *x: np.asarray(x), *metrics)
-            rollout_times = jax.tree.map(lambda *x: np.mean(x), *rollout_times)
-            timing_dict = rollout_times | learn_timings
+            actor_timings = jax.tree.map(lambda *x: np.mean(x), *actor_timings)
+            timing_dict = actor_timings | learner_timings
             timing_dict = jax.tree.map(np.mean, timing_dict, is_leaf=lambda x: isinstance(x, list))
             try:
                 # We add a timeout mainly for sanity checks
@@ -401,6 +397,8 @@ def learner_setup(
     SebulbaLearnerFn[CoreOffPolicyLearnerState, Transition],
     Tuple[ActorApply, CriticApply],
     CoreOffPolicyLearnerState,
+    Tuple[Callable, Callable],
+    BufferState,
 ]:
     """Setup for the learner state and networks."""
 
@@ -590,6 +588,12 @@ def run_experiment(_config: DictConfig) -> float:
         env_factory, eval_act_fn, config, np_rng, evaluator_device
     )
 
+    # Calculate the replay ratio
+    steps_per_insert = config.arch.actor.envs_per_actor * config.system.rollout_length
+    samples_per_inserted_batched_rollout = config.system.epochs
+    replay_ratio = samples_per_inserted_batched_rollout / steps_per_insert
+    config.system.replay_ratio = replay_ratio
+
     # Logger setup
     logger = StoixLogger(config)
     cfg: Dict = OmegaConf.to_container(config, resolve=True)
@@ -619,13 +623,17 @@ def run_experiment(_config: DictConfig) -> float:
     # Now we create the pipeline
     replay_buffer_add, replay_buffer_sample = buffer_fns
     # Set up the rate limiter that controls how actors and learners interact with the pipeline
-    if config.system.samples_to_insert > 1:
-        samples_per_insert_tolerance_rate = config.system.samples_per_insert_tolerance_rate
-        samples_per_insert_tolerance = samples_per_insert_tolerance_rate * config.system.samples_to_insert
-        error_buffer = config.system.min_replay_size * samples_per_insert_tolerance
-        rate_limiter = SampleToInsertRatio(config.system.replay_ratio, config.system.min_replay_size, error_buffer)
+    if config.arch.pipeline.samples_per_insert > 1:
+        samples_per_insert_tolerance_rate = config.arch.pipeline.samples_per_insert_tolerance_rate
+        samples_per_insert_tolerance = (
+            samples_per_insert_tolerance_rate * config.arch.pipeline.samples_per_insert
+        )
+        error_buffer = config.arch.pipeline.min_replay_size * samples_per_insert_tolerance
+        rate_limiter = SampleToInsertRatio(
+            config.system.epochs, config.arch.pipeline.min_replay_size, error_buffer
+        )
     else:
-        rate_limiter = MinSize(config.system.min_replay_size)
+        rate_limiter = MinSize(config.arch.pipeline.min_replay_size)  # type: ignore
     pipeline = OffPolicyPipeline(
         replay_buffer_add,
         replay_buffer_sample,
@@ -695,13 +703,12 @@ def run_experiment(_config: DictConfig) -> float:
         timings_dict["timestep"] = t
         logger.log(timings_dict, t, eval_step, LogEvent.MISC)
 
-        # TODO (edan): rework the way training metrics are returned
-        # episode_metrics, ep_completed = get_final_step_metrics(episode_metrics)
-        # episode_metrics["steps_per_second"] = (
-        #     steps_per_rollout / timings_dict["single_rollout_time"]
-        # )
-        # if ep_completed:
-        #     logger.log(episode_metrics, t, eval_step, LogEvent.ACT)
+        episode_metrics, ep_completed = get_final_step_metrics(episode_metrics)
+        episode_metrics["steps_per_second"] = (
+            steps_per_rollout / timings_dict["single_rollout_time"]
+        )
+        if ep_completed:
+            logger.log(episode_metrics, t, eval_step, LogEvent.ACT)
 
         logger.log(train_metrics, t, eval_step, LogEvent.TRAIN)
 

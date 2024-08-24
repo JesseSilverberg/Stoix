@@ -454,6 +454,13 @@ def run_experiment(_config: DictConfig) -> float:
         * config.arch.num_envs
     )
 
+    # Calculate the replay ratio
+    samples_per_inserted_batched_rollout = config.system.epochs
+    replay_ratio = samples_per_inserted_batched_rollout / (
+        config.system.rollout_length * config.arch.total_num_envs
+    )
+    config.system.replay_ratio = replay_ratio
+
     # Logger setup
     logger = StoixLogger(config)
     cfg: Dict = OmegaConf.to_container(config, resolve=True)
