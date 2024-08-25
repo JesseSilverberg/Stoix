@@ -422,6 +422,7 @@ def get_learner_rollout_fn(
     network parameters to a queue for evaluation."""
 
     def learner_rollout(learner_state: CoreLearnerState) -> None:
+        learner_step = 0
         # Loop for the total number of evaluations selected to be performed.
         for _ in range(config.arch.num_evaluation):
             # Create the lists to store metrics and timings for this learning iteration.
@@ -450,6 +451,7 @@ def get_learner_rollout_fn(
                 with RecordTimeTo(learner_timings["learning_time"]):
                     learner_state, train_metrics = learn_step(learner_state, traj_batch)
 
+                learner_step += 1
                 # We store the metrics and timings for this update
                 metrics.append((episode_metrics, train_metrics))
                 actor_timings.append(actor_times)
@@ -469,6 +471,7 @@ def get_learner_rollout_fn(
             actor_timings = jax.tree.map(lambda *x: np.mean(x), *actor_timings)
             timing_dict = actor_timings | learner_timings
             timing_dict["pipeline_qsize"] = q_sizes
+            timing_dict["learner_step"] = [learner_step]
             timing_dict = jax.tree.map(np.mean, timing_dict, is_leaf=lambda x: isinstance(x, list))
             try:
                 # We add a timeout mainly for sanity checks

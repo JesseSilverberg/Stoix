@@ -196,6 +196,7 @@ class OffPolicyPipeline(threading.Thread):
         traj: Sequence[StoixTransition],
         actor_timings_dict: Dict[str, List[float]],
         actor_episode_metrics: List[Dict[str, List[float]]],
+        timeout: Union[float, None] = None,
     ) -> None:
         start_condition, end_condition = (threading.Condition(), threading.Condition())
         with start_condition:
@@ -207,7 +208,7 @@ class OffPolicyPipeline(threading.Thread):
 
         # wait until we can insert the data
         try:
-            self.rate_limiter.await_can_insert(timeout=180)
+            self.rate_limiter.await_can_insert(timeout=timeout)
         except TimeoutError:
             print(
                 f"{Fore.RED}{Style.BRIGHT}Actor has timed out on insertion, "
@@ -223,7 +224,7 @@ class OffPolicyPipeline(threading.Thread):
 
         # signal that we have inserted the data
         self.rate_limiter.insert()
-        
+
         # Concatenate metrics - List[Dict[str, List[float]]] --> Dict[str, List[float]]
         actor_episode_metrics = self.concatenate_metrics(actor_episode_metrics)
 
@@ -261,6 +262,18 @@ class OffPolicyPipeline(threading.Thread):
 
         return sharded_sampled_batch, actor_timings, actor_metrics  # type: ignore
 
+    def get_num_inserts(self) -> int:
+        """Get the number of inserts that have been made to the buffer."""
+        return self.rate_limiter.num_inserts()
+
+    def get_num_samples(self) -> int:
+        """Get the number of samples that have been made from the buffer."""
+        return self.rate_limiter.num_samples()
+
+    def get_num_deletes(self) -> int:
+        """Get the number of deletes that have been made from the buffer."""
+        return self.rate_limiter.num_deletes()
+
     @partial(jax.jit, static_argnums=(0, 2))
     def stack_trajectory(self, trajectory: List[StoixTransition], axis: int = 0) -> StoixTransition:
         """Stack a list of parallel_env transitions into a single
@@ -271,7 +284,7 @@ class OffPolicyPipeline(threading.Thread):
         """Split the payload over the learner devices."""
         split_payload = jnp.split(payload, len(self.learner_devices), axis=axis)
         return jax.device_put_sharded(split_payload, devices=self.learner_devices)
-    
+
     @partial(jax.jit, static_argnums=(0,))
     def concatenate_metrics(
         self, actor_metrics: List[Dict[str, List[float]]]

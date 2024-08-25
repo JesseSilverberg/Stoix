@@ -38,7 +38,7 @@ from stoix.utils.checkpointing import Checkpointer
 from stoix.utils.env_factory import EnvFactory
 from stoix.utils.logger import LogEvent, StoixLogger
 from stoix.utils.loss import q_learning
-from stoix.utils.rate_limiters import MinSize, SampleToInsertRatio
+from stoix.utils.rate_limiters import SampleToInsertRatio
 from stoix.utils.sebulba_utils import (
     OffPolicyPipeline,
     ParamsSource,
@@ -156,8 +156,8 @@ def get_rollout_fn(
                 # Send the trajectory to the pipeline
                 with RecordTimeTo(actor_timings_dict["rollout_put_time"]):
                     try:
-                        pipeline.put(traj, actor_timings_dict, episode_metrics)
-                    except queue.Full:
+                        pipeline.put(traj, actor_timings_dict, episode_metrics, timeout=60)
+                    except TimeoutError:
                         warnings.warn(
                             "Waited too long to add to the rollout queue, killing the actor thread",
                             stacklevel=2,
@@ -325,7 +325,14 @@ def get_learner_rollout_fn(
                 # Get the trajectory batch from the pipeline
                 # This is blocking so it will wait until the pipeline has data.
                 with RecordTimeTo(learner_timings["rollout_get_time"]):
-                    traj_batch, actor_times, episode_metrics = pipeline.get()  # type: ignore
+                    try:
+                        traj_batch, actor_times, episode_metrics = pipeline.get(timeout=60)  # type: ignore
+                    except TimeoutError:
+                        warnings.warn(
+                            "Waited too long to sample from pipeline, killing the learner thread",
+                            stacklevel=2,
+                        )
+                        break
 
                 # We then call the update function to update the networks
                 with RecordTimeTo(learner_timings["learning_time"]):
@@ -348,6 +355,13 @@ def get_learner_rollout_fn(
             episode_metrics, train_metrics = jax.tree.map(lambda *x: np.asarray(x), *metrics)
             actor_timings = jax.tree.map(lambda *x: np.mean(x), *actor_timings)
             timing_dict = actor_timings | learner_timings
+            buffer_size = (
+                (pipeline.get_num_inserts() - pipeline.get_num_deletes())
+                * config.arch.actor.envs_per_actor
+                * config.system.rollout_length
+            )
+            timing_dict["buffer_size"] = [buffer_size]
+            timing_dict["num_samples"] = [pipeline.get_num_samples()]
             timing_dict = jax.tree.map(np.mean, timing_dict, is_leaf=lambda x: isinstance(x, list))
             try:
                 # We add a timeout mainly for sanity checks
@@ -623,18 +637,12 @@ def run_experiment(_config: DictConfig) -> float:
     # Now we create the pipeline
     replay_buffer_add, replay_buffer_sample = buffer_fns
     # Set up the rate limiter that controls how actors and learners interact with the pipeline
-    if config.system.epochs > 0:
-        samples_per_insert_tolerance_rate = config.arch.pipeline.samples_per_insert_tolerance_rate
-        samples_per_insert_tolerance = (
-            samples_per_insert_tolerance_rate * config.system.epochs
-        )
-        error_buffer = config.arch.pipeline.min_replay_size * samples_per_insert_tolerance
-        rate_limiter = SampleToInsertRatio(
-            config.system.epochs, config.arch.pipeline.min_replay_size, error_buffer
-        )
-    else:
-        pass
-    rate_limiter = MinSize(config.arch.pipeline.min_replay_size)  # type: ignore
+    samples_per_insert_tolerance_rate = 0.1  # This allows for 10% tolerance
+    samples_per_insert_tolerance = samples_per_insert_tolerance_rate * config.system.epochs
+    error_buffer = config.system.total_batch_size * samples_per_insert_tolerance
+    min_inserts = max(config.system.total_batch_size // steps_per_insert, 1)
+    rate_limiter = SampleToInsertRatio(config.system.epochs, min_inserts, error_buffer)
+
     pipeline = OffPolicyPipeline(
         replay_buffer_add,
         replay_buffer_sample,
